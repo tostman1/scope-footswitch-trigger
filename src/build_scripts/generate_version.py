@@ -16,7 +16,9 @@ if not match:
     raise ValueError("APP_VERSION nicht gefunden in OsciFootswitch.py")
 
 app_version = match.group(1)
-major, minor = (app_version.split("."))
+parts = app_version.split(".", 1)
+major = parts[0]
+minor = parts[1] if len(parts) > 1 else "0"
 
 # Version-Datei für PyInstaller erstellen
 version_txt = f"""

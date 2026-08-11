@@ -81,9 +81,9 @@ class LeCroyScope(BaseScope):
             self.scope.write_termination = ''
             self.scope.read_termination = ''
             try:
-                # Send raw binary — already in the correct LeCroy binary format
+                # Send raw binary — already in the correct LeCroy binary format.
+                # flush() is not implemented in pyvisa-py over TCP — omitted intentionally.
                 self.scope.write_raw(data)
-                self.scope.flush(pyvisa.constants.VI_WRITE_BUF)
             finally:
                 self.scope.write_termination = '\n'
                 self.scope.read_termination = '\n'

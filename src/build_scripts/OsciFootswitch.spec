@@ -23,11 +23,15 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# --onefile: all binaries and data are bundled inside the single EXE.
+# On first launch PyInstaller extracts to a temp folder; subsequent launches
+# reuse the cached extraction so startup time is normal.
 exe = EXE(
     pyz,
     a.scripts,
-    [],
-    exclude_binaries=True,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     name='OsciFootswitch',
     debug=False,
     bootloader_ignore_signals=False,
@@ -36,14 +40,4 @@ exe = EXE(
     console=False,
     icon='../assets/icon.ico',
     version='../assets/version.txt'
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    name='OsciFootswitch'
 )

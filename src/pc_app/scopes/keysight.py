@@ -111,12 +111,14 @@ class KeysightScope(BaseScope):
             self.scope.read_termination = ''
             try:
                 self.scope.write_raw(b":SYSTem:SETup " + payload)
-                self.scope.flush(pyvisa.constants.VI_WRITE_BUF)
+                # flush() is not implemented in pyvisa-py over TCP — omitted intentionally.
+                # write_raw() sends data immediately; no buffering on TCP connections.
             finally:
                 self.scope.write_termination = '\n'
                 self.scope.read_termination = '\n'
 
             return True
 
-        except Exception:
+        except Exception as e:
+            self.log(f"Setup write error: {e}")
             return False

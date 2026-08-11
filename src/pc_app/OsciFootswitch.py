@@ -8,6 +8,7 @@ import serial
 import serial.tools.list_ports
 import time
 import pyvisa
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, QSettings
@@ -29,7 +30,7 @@ from scopes.lecroy import LeCroyScope
 # Version
 # ----------------------------
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 def get_git_version():
     try:
@@ -76,7 +77,7 @@ class SerialReader(threading.Thread):
         if self.ser:
             try:
                 self.ser.cancel_read()
-            except:
+            except Exception:
                 pass
             self.ser.close()
 
@@ -85,12 +86,26 @@ class SerialReader(threading.Thread):
 # ============================================================
 
 class ScopeController:
-    def __init__(self, log_callback=None, disconnect_callback=None):
+    RECONNECT_INTERVAL = 10   # seconds between reconnect attempts
+    RECONNECT_MAX_TRIES = 6   # give up after this many failed reconnects (~1 min)
+
+    def __init__(self, ui_queue: queue.Queue):
+        """All communication back to the UI goes through ui_queue so that
+        background threads never touch Qt widgets directly.
+
+        Message tuples posted to ui_queue:
+          ("scope_log",        str)          — log message
+          ("scope_disconnected", None)       — connection lost
+          ("scope_reconnected",  str)        — reconnected, IDN string
+        """
         self.rm = pyvisa.ResourceManager("@py")
         self.scope = None
         self.device: BaseScope | None = None
-        self.log = log_callback or (lambda msg: None)
-        self.on_disconnect = disconnect_callback or (lambda: None)
+        self._ui_queue = ui_queue
+
+        self._last_ip = ""          # remembered for auto-reconnect
+        self._reconnecting = False  # True while reconnect attempts are running
+        self._stop_reconnect = False  # set by disconnect() to abort reconnect loop
 
         # schützt VISA Zugriff gegen parallele Threads
         self.lock = threading.Lock()
@@ -102,11 +117,14 @@ class ScopeController:
         )
         self.keep_alive_thread.start()
 
+    def _log(self, msg: str):
+        """Thread-safe logging: post to UI queue instead of calling Qt directly."""
+        self._ui_queue.put(("scope_log", msg))
+
     def connect(self, ip):
+        self._last_ip = ip
         with self.lock:
             # Always create a fresh ResourceManager for each connection attempt.
-            # This guarantees that scan activity (which opens/closes its own RMs)
-            # can never corrupt the state of the RM used for the actual scope session.
             try:
                 self.rm.close()
             except Exception:
@@ -121,22 +139,19 @@ class ScopeController:
             username = os.getenv("USERNAME") or os.getenv("USER") or "Unknown"
 
             if "LECROY" in idn_u:
-                self.device = LeCroyScope(self.scope, self.log, username)
-                self.log("Detected LeCroy oscilloscope")
+                self.device = LeCroyScope(self.scope, self._log, username)
+                self._log("Detected LeCroy oscilloscope")
 
             elif "KEYSIGHT" in idn_u or "AGILENT" in idn_u:
-
                 if "MSO70" in idn_u or "DSO70" in idn_u:
-                    self.device = Keysight7000Scope(self.scope, self.log, username)
-                    self.log("Detected Keysight/Agilent 7000 oscilloscope")
-
+                    self.device = Keysight7000Scope(self.scope, self._log, username)
+                    self._log("Detected Keysight/Agilent 7000 oscilloscope")
                 else:
-                    self.device = KeysightScope(self.scope, self.log, username)
-                    self.log("Detected Keysight/Agilent oscilloscope")
-
+                    self.device = KeysightScope(self.scope, self._log, username)
+                    self._log("Detected Keysight/Agilent oscilloscope")
             else:
-                self.device = KeysightScope(self.scope, self.log, username)
-                self.log("Unknown oscilloscope. Using Keysight/Agilent commands as default.")
+                self.device = KeysightScope(self.scope, self._log, username)
+                self._log("Unknown oscilloscope. Using Keysight/Agilent commands as default.")
 
             return idn
 
@@ -144,41 +159,96 @@ class ScopeController:
 
     def _keep_alive_loop(self):
         while self.keep_alive_running:
-            time.sleep(10)
-            if self.scope is None:
+            time.sleep(self.RECONNECT_INTERVAL)
+            # _reconnecting is only written by this thread or disconnect() on the
+            # main thread. Python's GIL makes the boolean read safe here.
+            if self.scope is None or self._reconnecting:
                 continue
             try:
                 with self.lock:
                     self.scope.query("*IDN?")
-
             except Exception as e:
-                self.log(f"Scope connection lost: {e}")
-                self._disconnect()
+                self._log(f"Scope connection lost: {e}")
+                self._disconnect(notify=False)
+                if self._last_ip:
+                    self._auto_reconnect()
+                else:
+                    self._ui_queue.put(("scope_disconnected", None))
 
-    def _disconnect(self):
-        # Note: must NOT be called while self.lock is held (not reentrant)
+    def _disconnect(self, notify=True):
+        """Close the scope resource and clear state.
+        Must NOT be called while self.lock is held (lock is not reentrant)."""
         with self.lock:
             try:
                 if self.scope:
                     self.scope.close()
-
             except Exception:
                 pass
-
             self.scope = None
             self.device = None
 
-        self.log("Scope disconnected")
-        self.on_disconnect()
+        self._log("Scope disconnected")
+        if notify:
+            self._ui_queue.put(("scope_disconnected", None))
 
     def disconnect(self):
+        """Manual disconnect — clears last IP so auto-reconnect does not trigger."""
+        self._last_ip = ""
+        self._stop_reconnect = True   # abort any running reconnect loop
         self._disconnect()
+
+    def shutdown(self):
+        """Stop background threads cleanly. Call from closeEvent."""
+        self.keep_alive_running = False
+        self._stop_reconnect = True
+        self._last_ip = ""
+        with self.lock:
+            try:
+                if self.scope:
+                    self.scope.close()
+            except Exception:
+                pass
+            self.scope = None
+            self.device = None
+
+    def _auto_reconnect(self):
+        """Try to reconnect to the last known IP in the background.
+        Attempts RECONNECT_MAX_TRIES times with RECONNECT_INTERVAL seconds between.
+        Posts scope_disconnected or scope_reconnected to ui_queue when done."""
+        self._reconnecting = True
+        self._stop_reconnect = False
+        # Notify UI immediately that we are disconnected and reconnecting
+        self._ui_queue.put(("scope_disconnected", None))
+
+        def worker():
+            for attempt in range(1, self.RECONNECT_MAX_TRIES + 1):
+                if not self.keep_alive_running or self._stop_reconnect:
+                    break
+                self._log(f"Reconnect attempt {attempt}/{self.RECONNECT_MAX_TRIES}…")
+                time.sleep(self.RECONNECT_INTERVAL)
+                if not self.keep_alive_running or self._stop_reconnect:
+                    break
+                try:
+                    idn = self.connect(self._last_ip)
+                    self._log(f"Reconnected: {idn.strip()}")
+                    self._reconnecting = False
+                    self._ui_queue.put(("scope_reconnected", idn.strip()))
+                    return
+                except Exception as e:
+                    self._log(f"Reconnect failed: {e}")
+
+            # All attempts exhausted or aborted
+            self._reconnecting = False
+            if not self._stop_reconnect:
+                self._log("Auto-reconnect gave up. Please reconnect manually.")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- Device Check ----------
 
     def _require_device(self) -> bool:
         if not self.device:
-            self.log("Scope not connected")
+            self._log("Scope not connected")
             return False
         return True
 
@@ -295,11 +365,11 @@ class MainWindow(QWidget):
         self._serial_open = False           # True while serial port is open
         self._waiting_for_single = False    # True after B2S/B2L until scope stops
         self._single_poll_counter = 0       # counts 50ms ticks between polls
+        self._single_poll_total = 0         # total ticks since SINGLE — for timeout
 
-        self.scope = ScopeController(
-            log_callback=self.log_msg,
-            disconnect_callback=self._on_scope_disconnected,
-        )
+        # ScopeController posts all messages to result_queue so background
+        # threads never touch Qt widgets directly (thread safety).
+        self.scope = ScopeController(ui_queue=self.result_queue)
 
         self.init_ui()
         self._load_settings()
@@ -702,10 +772,12 @@ class MainWindow(QWidget):
         # Derive subnet from the current IP (use first three octets).
         # Fall back to a broad default if the IP is not yet set.
         parts = current_ip.split(".")
-        if len(parts) == 4 and all(p.isdigit() for p in parts):
+        if (len(parts) == 4
+                and all(p.isdigit() for p in parts)
+                and all(0 <= int(p) <= 255 for p in parts)):
             subnet = ".".join(parts[:3])
         else:
-            self.log_msg("Enter a valid IP first so the subnet can be derived (e.g. 10.53.48.1)")
+            self.log_msg("Enter a valid IP address first (e.g. 10.53.48.1)")
             return
 
         self.scan_btn.setEnabled(False)
@@ -749,18 +821,21 @@ class MainWindow(QWidget):
             lock = threading.Lock()
             candidates = set()
 
-            # Phase 1: parallel raw-socket sweep on VXI-11 (111) and SCPI (5025)
-            threads = []
-            for i in range(1, 255):
-                ip = f"{subnet}.{i}"
-                for port in (111, 5025):
-                    t = threading.Thread(
-                        target=probe_port, args=(ip, port, candidates, lock), daemon=True
-                    )
-                    threads.append(t)
-                    t.start()
-            for t in threads:
-                t.join(timeout=1.5)
+            # Phase 1: bounded thread pool for raw-socket sweep (max 50 workers).
+            # 254 hosts × 2 ports = 508 tasks, but only 50 run simultaneously
+            # to avoid exhausting OS thread/socket resources.
+            host_port_pairs = [
+                (f"{subnet}.{i}", port)
+                for i in range(1, 255)
+                for port in (111, 5025)
+            ]
+            with ThreadPoolExecutor(max_workers=50) as pool:
+                futures = {
+                    pool.submit(probe_port, ip, port, candidates, lock): (ip, port)
+                    for ip, port in host_port_pairs
+                }
+                for f in as_completed(futures, timeout=2.0):
+                    pass  # results collected via candidates set in probe_port
 
             if not candidates:
                 self.result_queue.put(("scan_done", []))
@@ -801,10 +876,20 @@ class MainWindow(QWidget):
         else:
             self._connect_scope()
 
+    @staticmethod
+    def _is_valid_ip(ip: str) -> bool:
+        parts = ip.split(".")
+        return (len(parts) == 4
+                and all(p.isdigit() for p in parts)
+                and all(0 <= int(p) <= 255 for p in parts))
+
     def _connect_scope(self):
         ip = self._get_ip()
         if not ip:
             self.log_msg("No IP address entered")
+            return
+        if not self._is_valid_ip(ip):
+            self.log_msg(f"Invalid IP address: '{ip}'  (expected format: 192.168.1.10)")
             return
         try:
             idn = self.scope.connect(ip)
@@ -821,24 +906,28 @@ class MainWindow(QWidget):
         """Show the identify message on scope immediately after connect.
         After 5 seconds, clear it — unless the Identify checkbox is still checked,
         in which case leave it on (checkbox controls persistent display).
-        All SCPI calls run in a background thread to avoid blocking the UI."""
-        def _show():
-            try:
-                self.scope.identify(True)
-            except Exception:
-                pass
+        All SCPI calls run in background threads. The checkbox state is captured
+        on the main thread before spawning to avoid Qt access from bg threads."""
+        threading.Thread(
+            target=lambda: self._try_identify(True), daemon=True
+        ).start()
 
-        def _clear_if_unchecked():
-            if not self.identify_cb.isChecked():
-                try:
-                    self.scope.identify(False)
-                except Exception:
-                    pass
+        def _schedule_clear():
+            # Capture checkbox state on main thread here, before the lambda runs
+            keep_on = self.identify_cb.isChecked()
+            if not keep_on:
+                threading.Thread(
+                    target=lambda: self._try_identify(False), daemon=True
+                ).start()
 
-        threading.Thread(target=_show, daemon=True).start()
-        QTimer.singleShot(5000, lambda: threading.Thread(
-            target=_clear_if_unchecked, daemon=True
-        ).start())
+        QTimer.singleShot(5000, _schedule_clear)
+
+    def _try_identify(self, enable: bool):
+        """Send identify command from a background thread."""
+        try:
+            self.scope.identify(enable)
+        except Exception:
+            pass
 
     # Stylesheet for a button in "active/connected" state.
     # Includes hover and pressed pseudo-states so it behaves like a normal button,
@@ -862,9 +951,7 @@ class MainWindow(QWidget):
             self.scan_btn.setEnabled(True)
             self.identify_cb.setChecked(False)
 
-    def _on_scope_disconnected(self):
-        # Called from background thread — post to UI via queue
-        self.result_queue.put(("scope_disconnected", None))
+
 
     def identify_scope(self, checked: bool):
         try:
@@ -916,6 +1003,7 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         self._save_settings()
+        self.scope.shutdown()       # stop keep-alive and reconnect threads cleanly
         if self.serial_thread:
             self.serial_thread.stop()
         event.accept()
@@ -938,7 +1026,9 @@ class MainWindow(QWidget):
 
     def update_preview_from_png(self, data: bytes):
         pixmap = QPixmap()
-        pixmap.loadFromData(data, "PNG")
+        if not pixmap.loadFromData(data, "PNG"):
+            self.log_msg("Warning: received image data could not be decoded as PNG")
+            return
         self._current_pixmap = pixmap
         self._current_png_data = data
         self._rescale_preview()
@@ -1068,11 +1158,25 @@ class MainWindow(QWidget):
         self._process_results()
         self._poll_single_done()
 
+    # Auto-preview polling: give up after 60 seconds (1200 × 50 ms ticks)
+    _SINGLE_POLL_TIMEOUT = 1200
+
     def _poll_single_done(self):
         """Poll scope every ~500 ms after a SINGLE shot to detect when acquisition
-        is complete, then automatically fetch and display the preview."""
+        is complete, then automatically fetch and display the preview.
+        Gives up after 60 seconds to avoid polling indefinitely if the scope
+        never stops (e.g. user pressed RUN without pressing B1S/B1L first)."""
         if not self._waiting_for_single or self._busy or not self.auto_preview_cb.isChecked():
             return
+
+        self._single_poll_total += 1
+        if self._single_poll_total >= self._SINGLE_POLL_TIMEOUT:
+            # 60 seconds elapsed — give up silently
+            self._waiting_for_single = False
+            self._single_poll_counter = 0
+            self._single_poll_total = 0
+            return
+
         self._single_poll_counter += 1
         if self._single_poll_counter < 10:   # 10 × 50 ms = 500 ms between polls
             return
@@ -1099,8 +1203,18 @@ class MainWindow(QWidget):
         while not self.result_queue.empty():
             kind, payload = self.result_queue.get()
 
-            if kind == "scope_disconnected":
+            if kind == "scope_log":
+                # Log message posted from a background thread — safe to call here
+                self.log_msg(payload)
+
+            elif kind == "scope_disconnected":
                 self._set_scope_connected(False)
+
+            elif kind == "scope_reconnected":
+                idn = payload
+                self._set_scope_connected(True)
+                self.log_msg(f"Auto-reconnected: {idn}")
+                self._flash_identify()
 
             elif kind == "preview_done":
                 self._set_busy(False)
@@ -1142,7 +1256,7 @@ class MainWindow(QWidget):
                 if ok:
                     self.log_msg(f"Setup loaded: {filename}")
                 else:
-                    self.log_msg(f"Failed to load setup: {filename}")
+                    self.log_msg(f"Failed to load setup: {filename} — see log above for details")
 
             elif kind == "load_setup_error":
                 self._set_busy(False)
@@ -1154,6 +1268,7 @@ class MainWindow(QWidget):
                     # Scope has stopped — acquisition complete, fetch preview
                     self._waiting_for_single = False
                     self._single_poll_counter = 0
+                    self._single_poll_total = 0
                     self.log_msg("Trigger acquired — loading preview")
                     self.preview_screenshot()
 
@@ -1190,6 +1305,7 @@ class MainWindow(QWidget):
         try:
             if event == "B1S":
                 self._waiting_for_single = False
+                self._single_poll_total = 0
                 if self.scope.is_running():
                     self.scope.stop()
                     self.log_msg(f"Event {event}: STOP")
@@ -1199,6 +1315,7 @@ class MainWindow(QWidget):
 
             elif event == "B1L":
                 self._waiting_for_single = False
+                self._single_poll_total = 0
                 self.scope.run()
                 self.scope.trigger_auto()
                 self.log_msg(f"Event {event}: RUN, TRIGGER AUTO")
@@ -1207,12 +1324,14 @@ class MainWindow(QWidget):
                 self.scope.trigger_normal()
                 self.scope.single()
                 self._waiting_for_single = True
+                self._single_poll_total = 0
                 self.log_msg(f"Event {event}: SINGLE, TRIGGER NORMAL")
 
             elif event == "B2L":
                 self.scope.single()
                 self.scope.trigger_force()
                 self._waiting_for_single = True
+                self._single_poll_total = 0
                 self.log_msg(f"Event {event}: SINGLE, TRIGGER FORCE")
 
             elif event == "BBS":
@@ -1237,6 +1356,10 @@ class MainWindow(QWidget):
             cursor.select(cursor.LineUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()  # remove the trailing newline
+        # always scroll to the latest entry
+        self.log.verticalScrollBar().setValue(
+            self.log.verticalScrollBar().maximum()
+        )
 
     def _clear_log(self):
         self.log.clear()
