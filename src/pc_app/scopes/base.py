@@ -6,9 +6,10 @@ import pyvisa
 # ----------------------------
 class BaseScope:
 
-    def __init__(self, scope: pyvisa.resources.Resource, log):
+    def __init__(self, scope: pyvisa.resources.Resource, log, username: str = ""):
         self.scope = scope
         self.log = log
+        self.username = username or "Unknown"
         self.running = False
 
     def identify(self, enable: bool):
@@ -38,8 +39,8 @@ class BaseScope:
     def get_screenshot_png(self, color: bool, inverted: bool) -> bytes:
         raise NotImplementedError
 
-    def save_setup(self, filename: str):
+    def get_setup(self) -> bytes:
         raise NotImplementedError
 
-    def write_setup(self, filename: str) -> bool:
+    def write_setup_data(self, data: bytes) -> bool:
         raise NotImplementedError

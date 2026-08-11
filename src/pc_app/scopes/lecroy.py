@@ -11,7 +11,7 @@ class LeCroyScope(BaseScope):
 
     def identify(self, enable: bool):
         if enable:
-            self.scope.write('MESSAGE "FOOT SWITCH IDENTIFIER"')
+            self.scope.write(f'MESSAGE "{self.username} has connected via OsciFootswitch Tool"')
         else:
             self.scope.write('MESSAGE ""')
 
@@ -58,24 +58,21 @@ class LeCroyScope(BaseScope):
         return png_buffer.getvalue()
 
     def get_setup(self) -> bytes:
-
-        # --- Binary mode ---
+        old_timeout = self.scope.timeout
         self.scope.write_termination = ''
         self.scope.read_termination = ''
-        old_timeout = self.scope.timeout
         self.scope.timeout = 5000
-
-        # --- Request setup ---
-        raw = self.scope.query_binary_values( # SAVE/RECALL SETUP PANEL_SETUP, PNSU
-            "PNSU?",
-            datatype='B',
-            container=bytes
-        )
-
-        # --- Restore ASCII mode ---
-        self.scope.write_termination = '\n'
-        self.scope.read_termination = '\n'
-        self.scope.timeout = old_timeout
+        try:
+            # PNSU? = Panel Setup — returns binary setup data
+            raw = self.scope.query_binary_values(
+                "PNSU?",
+                datatype='B',
+                container=bytes
+            )
+        finally:
+            self.scope.write_termination = '\n'
+            self.scope.read_termination = '\n'
+            self.scope.timeout = old_timeout
 
         return raw
 
@@ -83,13 +80,13 @@ class LeCroyScope(BaseScope):
         try:
             self.scope.write_termination = ''
             self.scope.read_termination = ''
-
-            # Send direct to device without any processing, as the setup file is already in the correct binary format
-            self.scope.write_raw(data)
-            self.scope.flush(pyvisa.constants.VI_WRITE_BUF)
-
-            self.scope.write_termination = '\n'
-            self.scope.read_termination = '\n'
+            try:
+                # Send raw binary — already in the correct LeCroy binary format
+                self.scope.write_raw(data)
+                self.scope.flush(pyvisa.constants.VI_WRITE_BUF)
+            finally:
+                self.scope.write_termination = '\n'
+                self.scope.read_termination = '\n'
 
             return True
 

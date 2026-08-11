@@ -6,33 +6,37 @@ import pyvisa
 # Keysight / Agilent 7000 Scope
 # ----------------------------
 class Keysight7000Scope(KeysightScope):
+
+    def trigger_force(self):
+        # The 7000A series does not support :TRIG:FORC.
+        # Forcing a trigger is achieved by briefly switching the sweep mode to
+        # AUTO (which triggers immediately) and then back to NORMAL so the scope
+        # stops after the forced acquisition.
+        self.scope.write(":TRIG:SWE AUTO")
+        self.scope.write(":TRIG:SWE NORM")
+
     def get_screenshot_png(self, color: bool, inverted: bool) -> bytes:
 
         palette = "COLor" if color else "GRAYscale"
         inksaver = "ON" if inverted else "OFF"
 
-        # ---------- Binary mode ----------
+        old_timeout = self.scope.timeout
         self.scope.write_termination = ''
         self.scope.read_termination = ''
-        old_timeout = self.scope.timeout
         self.scope.timeout = 10000
+        try:
+            self.scope.write(f":HARDcopy:INKSaver {inksaver}")
+            raw = self.scope.query_binary_values(
+                f":DISPlay:DATA? PNG,SCReen,{palette}",
+                datatype='B',
+                container=bytes
+            )
+        finally:
+            self.scope.write_termination = '\n'
+            self.scope.read_termination = '\n'
+            self.scope.timeout = old_timeout
 
-        # ---------- Apply InkSaver ----------
-        self.scope.write(f":HARDcopy:INKSaver {inksaver}")
-
-        # ---------- Request screen dump ----------
-        raw = self.scope.query_binary_values(
-            f":DISPlay:DATA? PNG,SCReen,{palette}",
-            datatype='B',
-            container=bytes
-        )
-
-        # ---------- Restore ASCII mode ----------
-        self.scope.write_termination = '\n'
-        self.scope.read_termination = '\n'
-        self.scope.timeout = old_timeout
-
-        # ---------- Strip IEEE-488.2 binary header ----------
+        # Strip IEEE-488.2 binary block header
         if raw.startswith(b"#"):
             n = int(raw[1:2])
             length = int(raw[2:2 + n])
