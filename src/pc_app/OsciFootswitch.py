@@ -12,17 +12,21 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, QSettings
-from PySide6.QtGui import QPixmap, QFont, QIcon
+from PySide6.QtGui import QPixmap, QFont, QIcon, QAction
 from PySide6.QtWidgets import (
     QApplication, QLayout, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QComboBox, QCheckBox, QTextEdit, QSpinBox,
-    QFileDialog, QSizePolicy, QGridLayout, QFrame, QGroupBox
+    QFileDialog, QSizePolicy, QGridLayout, QFrame, QGroupBox, QMenuBar,
+    QScrollArea,
 )
 
 from scopes.base import BaseScope
 from scopes.keysight import KeysightScope
 from scopes.keysight7000 import Keysight7000Scope
 from scopes.lecroy import LeCroyScope
+
+from keyboard_mapping import KeyboardMappingSettings, KeyboardButtonService
+from keyboard_mapping_ui import KeyboardMappingWindow
 
 
 # ---------------------------------------------------------------------------
@@ -436,10 +440,23 @@ class MainWindow(QWidget):
         # never touch Qt widgets.
         self.scope = ScopeController(ui_queue=self.result_queue)
 
+        # Keyboard mapping service — started after settings are loaded.
+        # Events are posted into event_queue so handle_event() processes them
+        # identically to physical footswitch events.
+        kbd_settings = KeyboardMappingSettings.load_from_settings(self.settings)
+        self.kbd_service = KeyboardButtonService(self.event_queue, kbd_settings)
+
+        # Reference to the (non-modal) keyboard mapping window — only one at a time.
+        self._kbd_mapping_window = None
+
         self.init_ui()
         self._load_settings()
         self.refresh_serial_ports()
         self._restore_serial_port()   # must run after the combo is populated
+
+        # Start keyboard service after UI is ready (needs message loop running)
+        if kbd_settings.enabled:
+            self._start_kbd_service()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
@@ -485,6 +502,24 @@ class MainWindow(QWidget):
         # Outer layout: centers all content horizontally when window is wider
         outer = QVBoxLayout()
         outer.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ---- Menu bar ----
+        self._menu_bar = QMenuBar()
+        btn_mapping_menu = self._menu_bar.addMenu("Button Mapping")
+
+        fs_mapping_action = QAction("Footswitch Mapping", self)
+        fs_mapping_action.setToolTip("Show the footswitch function button grid")
+        fs_mapping_action.triggered.connect(self._show_footswitch_mapping)
+        btn_mapping_menu.addAction(fs_mapping_action)
+
+        kbd_mapping_action = QAction("Keyboard Mapping", self)
+        kbd_mapping_action.setToolTip("Configure a keyboard to act as auxiliary footswitch")
+        kbd_mapping_action.triggered.connect(self._show_keyboard_mapping)
+        btn_mapping_menu.addAction(kbd_mapping_action)
+
+        outer.addWidget(self._menu_bar)
 
         # Inner widget holds the actual content at a natural width
         inner = QWidget()
@@ -1101,11 +1136,59 @@ class MainWindow(QWidget):
             self.serial_combo.setEnabled(True)
             self.scan_serial_btn.setEnabled(True)
 
+    def _start_kbd_service(self) -> None:
+        """Start the Raw Input background thread for keyboard mapping."""
+        ok = self.kbd_service.start()
+        if not ok:
+            self.log_msg("Warning: Keyboard mapping service failed to start.")
+
+    # ---------- Button Mapping menu actions ----------
+
+    def _show_footswitch_mapping(self) -> None:
+        """Scroll/focus the footswitch function button area (it is always visible)."""
+        # The fs_grid is always visible in the main window — just bring window
+        # to front so the user can see it.
+        self.raise_()
+        self.activateWindow()
+
+    def _show_keyboard_mapping(self) -> None:
+        """Open (or focus) the non-modal Keyboard Mapping settings window."""
+        if self._kbd_mapping_window and not self._kbd_mapping_window.isHidden():
+            self._kbd_mapping_window.raise_()
+            self._kbd_mapping_window.activateWindow()
+            return
+
+        # Ensure service is started when window opens
+        if not (self.kbd_service._raw_thread and self.kbd_service._raw_thread.is_alive()):
+            self._start_kbd_service()
+
+        self._kbd_mapping_window = KeyboardMappingWindow(
+            service=self.kbd_service,
+            get_qsettings=lambda: self.settings,
+            parent=self,
+        )
+        # When settings change (via panel save), also persist to QSettings
+        self._kbd_mapping_window.panel.settings_changed.connect(
+            self._on_kbd_settings_changed
+        )
+        self._kbd_mapping_window.show()
+
+    def _on_kbd_settings_changed(self, new_settings) -> None:
+        """Called when the keyboard mapping panel saves new settings."""
+        # Settings are already persisted by the panel; start service if needed.
+        if new_settings.enabled and not (
+            self.kbd_service._raw_thread and self.kbd_service._raw_thread.is_alive()
+        ):
+            self._start_kbd_service()
+
     def closeEvent(self, event):
         self._save_settings()
         self.scope.shutdown()       # stop keep-alive and reconnect threads cleanly
         if self.serial_thread:
             self.serial_thread.stop()
+        self.kbd_service.stop()     # release LL hook + Raw Input thread
+        if self._kbd_mapping_window:
+            self._kbd_mapping_window.close()
         event.accept()
 
     # ---------- Screenshot ----------
@@ -1303,6 +1386,11 @@ class MainWindow(QWidget):
         """Called every 50ms by QTimer. Drains both queues and runs the
         auto-preview poll. Keeping all queue processing here ensures Qt widgets
         are only ever touched from the main thread."""
+        # Keyboard service tick: drains raw event queue, advances long-press
+        # timers, handles identification countdown.  Events are posted into
+        # self.event_queue (same queue as the footswitch serial thread) so they
+        # flow naturally through _process_serial_events() below.
+        self.kbd_service.tick()
         self._process_serial_events()
         self._process_results()
         self._poll_single_done()
