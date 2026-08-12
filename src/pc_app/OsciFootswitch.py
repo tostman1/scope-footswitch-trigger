@@ -19,41 +19,54 @@ from PySide6.QtWidgets import (
     QFileDialog, QSizePolicy, QGridLayout, QFrame, QGroupBox
 )
 
-# Oscilloscope Implementations
 from scopes.base import BaseScope
 from scopes.keysight import KeysightScope
 from scopes.keysight7000 import Keysight7000Scope
 from scopes.lecroy import LeCroyScope
 
 
-# ----------------------------
+# ---------------------------------------------------------------------------
 # Version
-# ----------------------------
+# ---------------------------------------------------------------------------
 
 APP_VERSION = "1.3"
 
 def get_git_version():
+    """Append git commit hash and count to the version string when running from source.
+    Falls back to APP_VERSION alone when git is unavailable (e.g. inside the EXE)."""
     try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-
         count = subprocess.check_output(
             ["git", "rev-list", "--count", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-
         return f"{APP_VERSION} build {count} ({commit})"
     except Exception:
         return APP_VERSION
 
 VERSION = get_git_version()
 
-# ----------------------------
-# Serial Reader Thread
-# ----------------------------
+
+# ---------------------------------------------------------------------------
+# SerialReader — reads footswitch events from the Arduino Nano
+# ---------------------------------------------------------------------------
+
 class SerialReader(threading.Thread):
+    """Daemon thread that reads lines from the footswitch serial port and puts
+    them into event_queue for the main thread to process.
+
+    The Arduino sends short ASCII strings on every button event:
+      B1S, B1L  — Button 1 short/long press
+      B2S, B2L  — Button 2 short/long press
+      BBS, BBL  — Both buttons pressed simultaneously (short/long)
+
+    On any IO error (e.g. USB disconnected) the thread posts "ERROR:<reason>"
+    to the queue and exits, letting the main thread reset the UI.
+    """
+
     def __init__(self, port, baudrate, event_queue):
         super().__init__(daemon=True)
         self.port = port
@@ -76,72 +89,89 @@ class SerialReader(threading.Thread):
         self._running = False
         if self.ser:
             try:
-                self.ser.cancel_read()
+                self.ser.cancel_read()  # unblock readline() immediately
             except Exception:
                 pass
             self.ser.close()
 
-# ============================================================
-# Scope Controller (Factory + Delegation)
-# ============================================================
+
+# ---------------------------------------------------------------------------
+# ScopeController — VISA connection management and command delegation
+# ---------------------------------------------------------------------------
 
 class ScopeController:
-    RECONNECT_INTERVAL = 10   # seconds between reconnect attempts
-    RECONNECT_MAX_TRIES = 6   # give up after this many failed reconnects (~1 min)
+    """Manages the VISA connection to the oscilloscope and delegates commands
+    to the appropriate scope implementation (Keysight, LeCroy, etc.).
+
+    Threading model:
+    - All UI communication goes through ui_queue (never touch Qt widgets directly
+      from a background thread).
+    - self.lock protects the VISA resource (self.scope) against concurrent access
+      from the keep-alive thread and the main thread.
+    - The keep-alive thread pings *IDN? every RECONNECT_INTERVAL seconds.
+      On failure it triggers _auto_reconnect() which retries in the background.
+
+    ui_queue message tuples:
+      ("scope_log",          str)   — log message to display
+      ("scope_disconnected", None)  — connection was lost (update UI)
+      ("scope_reconnected",  str)   — successfully reconnected (IDN string)
+    """
+
+    RECONNECT_INTERVAL = 10   # seconds between keep-alive pings / reconnect attempts
+    RECONNECT_MAX_TRIES = 6   # max reconnect attempts before giving up (~1 minute)
 
     def __init__(self, ui_queue: queue.Queue):
-        """All communication back to the UI goes through ui_queue so that
-        background threads never touch Qt widgets directly.
+        self.rm = pyvisa.ResourceManager("@py")  # pyvisa-py pure-Python backend
+        self.scope = None                         # open VISA resource, or None
+        self.device: BaseScope | None = None      # brand-specific implementation
 
-        Message tuples posted to ui_queue:
-          ("scope_log",        str)          — log message
-          ("scope_disconnected", None)       — connection lost
-          ("scope_reconnected",  str)        — reconnected, IDN string
-        """
-        self.rm = pyvisa.ResourceManager("@py")
-        self.scope = None
-        self.device: BaseScope | None = None
         self._ui_queue = ui_queue
+        self._last_ip = ""            # stored for auto-reconnect after connection loss
+        self._reconnecting = False    # True while reconnect worker is active
+        self._stop_reconnect = False  # set by disconnect() / shutdown() to abort worker
 
-        self._last_ip = ""          # remembered for auto-reconnect
-        self._reconnecting = False  # True while reconnect attempts are running
-        self._stop_reconnect = False  # set by disconnect() to abort reconnect loop
-
-        # schützt VISA Zugriff gegen parallele Threads
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # guards self.scope against concurrent VISA access
 
         self.keep_alive_running = True
         self.keep_alive_thread = threading.Thread(
-            target=self._keep_alive_loop,
-            daemon=True
+            target=self._keep_alive_loop, daemon=True
         )
         self.keep_alive_thread.start()
 
     def _log(self, msg: str):
-        """Thread-safe logging: post to UI queue instead of calling Qt directly."""
+        """Post a log message to the UI queue (thread-safe)."""
         self._ui_queue.put(("scope_log", msg))
 
-    def connect(self, ip, timeout_ms: int = 5000):
+    def connect(self, ip: str, timeout_ms: int = 5000) -> str:
+        """Open a VISA connection to the scope at the given IP, query *IDN?,
+        and instantiate the correct brand implementation.
+
+        A fresh ResourceManager is created on every call so that previous scan
+        activity (which opens many short-lived connections) cannot corrupt the
+        socket state of the new session.
+
+        Returns the raw *IDN? response string.
+        """
         self._last_ip = ip
         with self.lock:
-            # Always create a fresh ResourceManager for each connection attempt.
             try:
-                self.rm.close()
+                self.rm.close()   # discard any leftover state from previous session
             except Exception:
                 pass
             self.rm = pyvisa.ResourceManager("@py")
             self.scope = self.rm.open_resource(f"TCPIP0::{ip}::INSTR")
             self.scope.timeout = timeout_ms
 
-            idn = self.scope.query("*IDN?")
+            idn   = self.scope.query("*IDN?")
             idn_u = idn.upper()
 
+            # Read the current Windows login name to personalise the identify message.
             username = os.getenv("USERNAME") or os.getenv("USER") or "Unknown"
 
+            # Select implementation based on manufacturer string in IDN response.
             if "LECROY" in idn_u:
                 self.device = LeCroyScope(self.scope, self._log, username)
                 self._log("Detected LeCroy oscilloscope")
-
             elif "KEYSIGHT" in idn_u or "AGILENT" in idn_u:
                 if "MSO70" in idn_u or "DSO70" in idn_u:
                     self.device = Keysight7000Scope(self.scope, self._log, username)
@@ -150,18 +180,22 @@ class ScopeController:
                     self.device = KeysightScope(self.scope, self._log, username)
                     self._log("Detected Keysight/Agilent oscilloscope")
             else:
+                # Unknown brand — try Keysight commands as a reasonable default.
                 self.device = KeysightScope(self.scope, self._log, username)
                 self._log("Unknown oscilloscope. Using Keysight/Agilent commands as default.")
 
             return idn
 
-    # ---------- Keep Alive ----------
+    # ---------------------------------------------------------------------------
+    # Keep-alive & auto-reconnect
+    # ---------------------------------------------------------------------------
 
     def _keep_alive_loop(self):
+        """Background thread: ping the scope every RECONNECT_INTERVAL seconds.
+        If the ping fails (network drop, screensaver power-save, etc.) trigger
+        an automatic reconnect sequence."""
         while self.keep_alive_running:
             time.sleep(self.RECONNECT_INTERVAL)
-            # _reconnecting is only written by this thread or disconnect() on the
-            # main thread. Python's GIL makes the boolean read safe here.
             if self.scope is None or self._reconnecting:
                 continue
             try:
@@ -175,16 +209,16 @@ class ScopeController:
                 else:
                     self._ui_queue.put(("scope_disconnected", None))
 
-    def _disconnect(self, notify=True):
-        """Close the scope resource and clear state.
-        Must NOT be called while self.lock is held (lock is not reentrant)."""
+    def _disconnect(self, notify: bool = True):
+        """Close the VISA resource and clear device state.
+        Must NOT be called while self.lock is held (Lock is not reentrant)."""
         with self.lock:
             try:
                 if self.scope:
                     self.scope.close()
             except Exception:
                 pass
-            self.scope = None
+            self.scope  = None
             self.device = None
 
         self._log("Scope disconnected")
@@ -192,38 +226,37 @@ class ScopeController:
             self._ui_queue.put(("scope_disconnected", None))
 
     def disconnect(self):
-        """Manual disconnect — clears last IP so auto-reconnect does not trigger."""
+        """Manual disconnect triggered by the user.
+        Clears _last_ip so the auto-reconnect loop does not re-connect."""
         self._last_ip = ""
-        self._stop_reconnect = True   # abort any running reconnect loop
+        self._stop_reconnect = True
         self._disconnect()
 
     def shutdown(self):
-        """Stop background threads cleanly. Call from closeEvent.
-        Sets flags first so any in-progress reconnect worker exits at its next
-        checkpoint, then closes the VISA resource without holding the lock
-        (to avoid deadlocking if connect() is mid-execution in the reconnect worker)."""
+        """Clean up on application exit (called from closeEvent).
+
+        Sets stop flags first so the reconnect worker exits at its next checkpoint.
+        Does NOT acquire self.lock to avoid a deadlock if connect() is currently
+        running on the reconnect thread and holding the lock.
+        """
         self.keep_alive_running = False
         self._stop_reconnect = True
         self._last_ip = ""
-        # Give the reconnect worker one iteration to notice the stop flag.
-        # We do NOT acquire self.lock here to avoid deadlock if connect() is
-        # currently holding it on the reconnect thread.
         try:
             if self.scope:
                 self.scope.close()
         except Exception:
             pass
-        self.scope = None
+        self.scope  = None
         self.device = None
 
     def _auto_reconnect(self):
-        """Try to reconnect to the last known IP in the background.
-        Attempts RECONNECT_MAX_TRIES times with RECONNECT_INTERVAL seconds between.
-        Posts scope_disconnected or scope_reconnected to ui_queue when done."""
+        """Spawn a background worker that repeatedly tries to reconnect.
+        The worker respects _stop_reconnect so disconnect() / shutdown() can
+        abort it cleanly between attempts."""
         self._reconnecting = True
         self._stop_reconnect = False
-        # Notify UI immediately that we are disconnected and reconnecting
-        self._ui_queue.put(("scope_disconnected", None))
+        self._ui_queue.put(("scope_disconnected", None))  # update UI immediately
 
         def worker():
             for attempt in range(1, self.RECONNECT_MAX_TRIES + 1):
@@ -242,16 +275,18 @@ class ScopeController:
                 except Exception as e:
                     self._log(f"Reconnect failed: {e}")
 
-            # All attempts exhausted or aborted
             self._reconnecting = False
             if not self._stop_reconnect:
                 self._log("Auto-reconnect gave up. Please reconnect manually.")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---------- Device Check ----------
+    # ---------------------------------------------------------------------------
+    # Guard & delegation helpers
+    # ---------------------------------------------------------------------------
 
     def _require_device(self) -> bool:
+        """Return True if a scope is connected, log a warning and return False otherwise."""
         if not self.device:
             self._log("Scope not connected")
             return False
@@ -328,10 +363,15 @@ class ScopeController:
         with self.lock:
             return self.device.write_setup_data(data)
 
-# ----------------------------
-# Serial ports dropdown
-# ----------------------------
+# ---------------------------------------------------------------------------
+# SerialPortComboBox — refreshes port list automatically when opened
+# ---------------------------------------------------------------------------
+
 class SerialPortComboBox(QComboBox):
+    """A QComboBox that re-scans available COM ports every time the user
+    opens the dropdown, so newly plugged-in devices appear without a manual
+    refresh action."""
+
     def __init__(self, refresh_callback, parent=None):
         super().__init__(parent)
         self.refresh_callback = refresh_callback
@@ -341,21 +381,37 @@ class SerialPortComboBox(QComboBox):
         super().showPopup()
 
 
-# ----------------------------
-# path finder for assets (icon)
-# ----------------------------
-def resource_path(relative):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def resource_path(relative: str) -> str:
+    """Resolve a path to a bundled asset when running as a PyInstaller EXE.
+    PyInstaller extracts assets to a temp folder (_MEIPASS); when running
+    from source the path is relative to the script directory."""
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative)
     return os.path.join(os.path.abspath("."), relative)
 
-# ----------------------------
-# Main GUI
-# ----------------------------
 
-LOG_MAX_LINES = 500
+# ---------------------------------------------------------------------------
+# MainWindow
+# ---------------------------------------------------------------------------
+
+LOG_MAX_LINES = 500   # maximum number of log lines kept in the UI text box
+
 
 class MainWindow(QWidget):
+    """Main application window.
+
+    Architecture summary:
+    - All slow operations (VISA queries, file I/O) run in daemon threads.
+    - Results are posted to result_queue as (kind, payload) tuples.
+    - A 50 ms QTimer (_tick) drains both event_queue (footswitch events from
+      the serial thread) and result_queue (scope/file results) on the main thread,
+      keeping all Qt widget updates single-threaded.
+    """
+
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
@@ -363,54 +419,52 @@ class MainWindow(QWidget):
 
         self.settings = QSettings("grafmar", "OsciFootswitch")
 
-        self.event_queue = queue.Queue()
-        self.result_queue = queue.Queue()   # worker thread results -> UI
-        self.serial_thread = None
-        self._busy = False                  # True while a background operation runs
-        self._serial_open = False           # True while serial port is open
-        self._waiting_for_single = False    # True after B2S/B2L until scope stops
-        self._single_poll_counter = 0       # counts 50ms ticks between polls
-        self._single_poll_total = 0         # total ticks since SINGLE — for timeout
-        self._single_poll_active = False    # True while a poll worker is in flight
+        self.event_queue  = queue.Queue()  # footswitch events from SerialReader
+        self.result_queue = queue.Queue()  # results from background workers + ScopeController
 
-        # ScopeController posts all messages to result_queue so background
-        # threads never touch Qt widgets directly (thread safety).
+        self.serial_thread = None
+        self._busy          = False   # True while a background VISA/file operation runs
+        self._serial_open   = False   # True while the serial port is open
+
+        # Auto-preview polling state (used after B2S/B2L to detect acquisition complete)
+        self._waiting_for_single  = False  # armed after SINGLE command
+        self._single_poll_counter = 0      # 50ms ticks between polls (fires every 500ms)
+        self._single_poll_total   = 0      # total ticks — used for 60s timeout
+        self._single_poll_active  = False  # guard: only one poll worker at a time
+
+        # ScopeController uses result_queue directly so its background threads
+        # never touch Qt widgets.
         self.scope = ScopeController(ui_queue=self.result_queue)
 
         self.init_ui()
         self._load_settings()
         self.refresh_serial_ports()
-        self._restore_serial_port()   # must run after refresh_serial_ports()
+        self._restore_serial_port()   # must run after the combo is populated
 
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
-        self.timer.start(50)
+        self.timer.start(50)   # 50ms tick drives both queue processors and auto-preview poll
 
-    # ---------- Settings ----------
+    # ---------------------------------------------------------------------------
+    # Settings persistence
+    # ---------------------------------------------------------------------------
 
     def _load_settings(self):
-        ip = self.settings.value("scope_ip", "10.53.48.1")
-        self.ip_combo.setCurrentText(ip)
-
-        # Serial port is restored in _restore_serial_port(), called after
-        # refresh_serial_ports() so the combo is already populated.
+        """Restore user preferences from QSettings.
+        Serial port is NOT restored here — see _restore_serial_port()."""
+        self.ip_combo.setCurrentText(self.settings.value("scope_ip", "10.53.48.1"))
         self._saved_serial_port = self.settings.value("serial_port", "")
-
-        self._last_save_dir = self.settings.value("save_dir", "")
-
-        auto = self.settings.value("auto_preview", False, type=bool)
-        self.auto_preview_cb.setChecked(auto)
-
-        timeout = self.settings.value("scpi_timeout", 5000, type=int)
-        self.scpi_timeout_spin.setValue(timeout)
-
-        # Restore window geometry
+        self._last_save_dir     = self.settings.value("save_dir", "")
+        self.auto_preview_cb.setChecked(self.settings.value("auto_preview", False, type=bool))
+        self.scpi_timeout_spin.setValue(self.settings.value("scpi_timeout", 5000, type=int))
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
 
     def _restore_serial_port(self):
-        """Restore last-used serial port after refresh_serial_ports() populates the combo."""
+        """Restore the last-used serial port selection.
+        Must be called after refresh_serial_ports() so findData() works on a
+        populated combo (calling it on an empty combo always returns -1)."""
         port = getattr(self, "_saved_serial_port", "")
         if port:
             idx = self.serial_combo.findData(port)
@@ -895,12 +949,14 @@ class MainWindow(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_busy(self, busy: bool):
+        """Enter/leave busy state: show wait cursor and disable all action buttons.
+        Busy state is active while a background VISA or file operation is running,
+        preventing a second operation from being triggered before the first completes."""
         self._busy = busy
         if busy:
             QApplication.setOverrideCursor(Qt.WaitCursor)
         else:
             QApplication.restoreOverrideCursor()
-        # disable/enable screenshot and footswitch buttons while an operation runs
         for btn in (self.preview_btn, self.save_btn, self.load_setup_btn):
             btn.setEnabled(not busy)
         for btn in self._fs_buttons.values():
@@ -930,6 +986,8 @@ class MainWindow(QWidget):
                 and all(0 <= int(p) <= 255 for p in parts))
 
     def _connect_scope(self):
+        """Validate the IP, open the VISA connection, update UI, and flash the
+        identify message on the scope screen for 5 seconds."""
         ip = self._get_ip()
         if not ip:
             self.log_msg("No IP address entered")
@@ -941,8 +999,6 @@ class MainWindow(QWidget):
             idn = self.scope.connect(ip, timeout_ms=self.scpi_timeout_spin.value())
             self.log_msg(f"Connected to scope: {idn.strip()}")
             self._set_scope_connected(True)
-            # Flash identify message on the scope screen for 5 seconds,
-            # regardless of the checkbox state.
             self._flash_identify()
         except Exception as e:
             self.log_msg(f"Connection failed: {e}")
@@ -1098,10 +1154,18 @@ class MainWindow(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def save_screenshot_and_setup(self):
+        """Save a screenshot and instrument setup file.
+
+        The filename dialog is shown FIRST (before querying the scope) so that
+        cancelling the dialog does not trigger an unnecessary VISA transfer.
+        The setup file is saved alongside the screenshot with the same base name
+        but a .set extension (e.g. screenshot_20260811_143205.set).
+        """
         if self._busy:
             return
 
-        # --- Step 1: ask for filename first (on main thread) ---
+        # Show dialog on main thread before starting any background work.
+        # Bring window to front in case it was minimised (triggered via footswitch).
         default_name = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
         start_path = os.path.join(self._last_save_dir, default_name)
 
@@ -1111,10 +1175,10 @@ class MainWindow(QWidget):
 
         dialog = QFileDialog(self, "Save Screenshot", start_path, "PNG Image (*.png)")
         dialog.setAcceptMode(QFileDialog.AcceptSave)
-        dialog.selectFile(default_name)
+        dialog.selectFile(default_name)   # pre-fill with timestamp, text selected
 
         if not dialog.exec():
-            return  # user cancelled — nothing fetched from scope
+            return  # cancelled — scope not queried
 
         filename = dialog.selectedFiles()[0]
         if not filename.lower().endswith(".png"):
@@ -1122,7 +1186,7 @@ class MainWindow(QWidget):
 
         self._last_save_dir = os.path.dirname(filename)
 
-        # --- Step 2: fetch data from scope in background ---
+        # Fetch screenshot and setup in a background thread to keep UI responsive.
         self._set_busy(True)
 
         color = self.color_cb.isChecked()
@@ -1211,6 +1275,9 @@ class MainWindow(QWidget):
     # ---------- Timer tick: process both queues ----------
 
     def _tick(self):
+        """Called every 50ms by QTimer. Drains both queues and runs the
+        auto-preview poll. Keeping all queue processing here ensures Qt widgets
+        are only ever touched from the main thread."""
         self._process_serial_events()
         self._process_results()
         self._poll_single_done()
@@ -1256,11 +1323,14 @@ class MainWindow(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _process_serial_events(self):
+        """Drain the serial event queue (footswitch button events from SerialReader).
+        ERROR: messages indicate the serial port died (e.g. USB unplugged) — the
+        UI is reset so the user can re-open the port without restarting the app.
+        Events are ignored while _busy to prevent double-triggering."""
         while not self.event_queue.empty():
             msg = self.event_queue.get()
             if msg.startswith("ERROR:"):
                 self.log_msg(f"Serial error: {msg[6:]}")
-                # Reset UI if the port died unexpectedly (e.g. USB unplugged)
                 if self._serial_open:
                     self._serial_open = False
                     self.serial_thread = None
@@ -1372,9 +1442,19 @@ class MainWindow(QWidget):
 
     # ---------- Event Handling ----------
 
-    def handle_event(self, event):
+    def handle_event(self, event: str):
+        """Map a footswitch event string to a scope command.
+
+        Event strings are produced by the Arduino firmware:
+          B1S / B1L — Button 1 short / long press
+          B2S / B2L — Button 2 short / long press
+          BBS / BBL — Both buttons short / long press
+
+        Also called by the on-screen footswitch function buttons (same events).
+        """
         try:
             if event == "B1S":
+                # Toggle RUN/STOP based on the current scope state.
                 self._waiting_for_single = False
                 self._single_poll_total = 0
                 if self.scope.is_running():
@@ -1419,18 +1499,19 @@ class MainWindow(QWidget):
 
     # ---------- Log ----------
 
-    def log_msg(self, msg):
+    def log_msg(self, msg: str):
+        """Append a timestamped message to the log widget.
+        Removes the oldest line when the log exceeds LOG_MAX_LINES to prevent
+        unbounded memory growth during long lab sessions."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log.append(f"[{timestamp}] {msg}")
-        # cap log at LOG_MAX_LINES
         doc = self.log.document()
         while doc.blockCount() > LOG_MAX_LINES:
             cursor = self.log.textCursor()
             cursor.movePosition(cursor.Start)
             cursor.select(cursor.LineUnderCursor)
             cursor.removeSelectedText()
-            cursor.deleteChar()  # remove the trailing newline
-        # always scroll to the latest entry
+            cursor.deleteChar()          # remove the now-empty line
         self.log.verticalScrollBar().setValue(
             self.log.verticalScrollBar().maximum()
         )
