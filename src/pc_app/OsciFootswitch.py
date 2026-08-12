@@ -1176,20 +1176,32 @@ class MainWindow(QWidget):
         inverted = self.invert_cb.isChecked()
         save_dir = self._last_save_dir
 
+        # Capture the timestamp now — this is the moment the user triggered the save.
+        # The dialog will open later (after the fetch completes), so computing the
+        # timestamp there would give the dialog-open time, not the capture time.
+        capture_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         def worker():
             try:
                 png_data   = self.scope.get_screenshot_png(color=color, inverted=inverted)
                 setup_data = self.scope.get_setup()
-                self.result_queue.put(("save_fetched", (png_data, setup_data, save_dir)))
+                self.result_queue.put(("save_fetched", (png_data, setup_data, save_dir, capture_ts)))
             except Exception as e:
                 self.result_queue.put(("save_error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _open_save_dialog(self, png_data: bytes, setup_data: bytes, save_dir: str):
+    def _open_save_dialog(self, png_data: bytes, setup_data: bytes, save_dir: str,
+                          capture_ts: str):
         """Open the save-file dialog after data has already been fetched.
-        Called from _process_results once the background fetch completes."""
-        default_name = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
+
+        This method must NOT be called directly from inside _process_results or
+        any QTimer callback.  It blocks on QFileDialog.exec() for as long as the
+        user keeps the dialog open, which would freeze the 50ms timer loop.
+        It is always scheduled via QTimer.singleShot(0, ...) so that the calling
+        timer callback can return and the Qt event loop stays responsive.
+        """
+        default_name = f"screenshot_{capture_ts}.png"
         start_path   = os.path.join(save_dir, default_name)
 
         # Bring window to front only if it is actually minimised (e.g. triggered
@@ -1204,28 +1216,33 @@ class MainWindow(QWidget):
         dialog.setAcceptMode(QFileDialog.AcceptSave)
         dialog.selectFile(default_name)   # pre-fill with timestamp, text selected
 
-        if not dialog.exec():
-            # User cancelled — data was already fetched but we discard it.
-            self.log_msg("Save cancelled")
-            return
-
-        filename = dialog.selectedFiles()[0]
-        if not filename.lower().endswith(".png"):
-            filename += ".png"
-
-        self._last_save_dir = os.path.dirname(filename)
-
         try:
-            self.update_preview_from_png(png_data)
-            with open(filename, "wb") as f:
-                f.write(png_data)
-            base, _ = os.path.splitext(filename)
-            setup_file = base + ".set"
-            with open(setup_file, "wb") as f:
-                f.write(setup_data)
-            self.log_msg(f"Saved: {filename}")
-        except Exception as e:
-            self.log_msg(f"Save error: {e}")
+            if not dialog.exec():
+                # User cancelled — data was already fetched but we discard it.
+                self.log_msg("Save cancelled")
+                return
+
+            filename = dialog.selectedFiles()[0]
+            if not filename.lower().endswith(".png"):
+                filename += ".png"
+
+            self._last_save_dir = os.path.dirname(filename)
+
+            try:
+                self.update_preview_from_png(png_data)
+                with open(filename, "wb") as f:
+                    f.write(png_data)
+                base, _ = os.path.splitext(filename)
+                setup_file = base + ".set"
+                with open(setup_file, "wb") as f:
+                    f.write(setup_data)
+                self.log_msg(f"Saved: {filename}")
+            except Exception as e:
+                self.log_msg(f"Save error: {e}")
+        finally:
+            # Always release busy state when the dialog closes, whether the user
+            # saved, cancelled, or an exception occurred.
+            self._set_busy(False)
 
     def save_preview_image(self):
         """Save the currently displayed preview PNG to disk — no scope query."""
@@ -1394,15 +1411,22 @@ class MainWindow(QWidget):
                 self.log_msg(f"Preview error: {payload}")
 
             elif kind == "save_fetched":
-                # Scope data fetched — now release busy state and open the file
-                # dialog so the user can choose a filename.  The data was captured
-                # at the moment the save button was pressed, not after dialog navigation.
-                self._set_busy(False)
-                png_data, setup_data, save_dir = payload
+                # Scope data fetched successfully.  Do NOT call _open_save_dialog
+                # here — that method blocks on QFileDialog.exec() for as long as
+                # the user keeps the dialog open, which would freeze this timer
+                # callback and prevent serial/scope events from being processed.
+                # Schedule the dialog via singleShot(0) so the current timer
+                # callback returns first and the Qt event loop stays responsive.
+                # _busy remains True until _open_save_dialog completes, preventing
+                # a second BBL/Save from firing while the dialog is open.
+                png_data, setup_data, save_dir, capture_ts = payload
                 if not png_data or not setup_data:
+                    self._set_busy(False)
                     self.log_msg("Save failed: no data received from scope")
                     continue
-                self._open_save_dialog(png_data, setup_data, save_dir)
+                QTimer.singleShot(0, lambda p=png_data, s=setup_data,
+                                         d=save_dir, t=capture_ts:
+                                  self._open_save_dialog(p, s, d, t))
 
             elif kind == "save_error":
                 self._set_busy(False)
