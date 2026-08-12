@@ -1156,20 +1156,47 @@ class MainWindow(QWidget):
     def save_screenshot_and_setup(self):
         """Save a screenshot and instrument setup file.
 
-        The filename dialog is shown FIRST (before querying the scope) so that
-        cancelling the dialog does not trigger an unnecessary VISA transfer.
-        The setup file is saved alongside the screenshot with the same base name
-        but a .set extension (e.g. screenshot_20260811_143205.set).
+        Data is fetched from the scope IMMEDIATELY when this method is called
+        (before any dialog appears) so that the captured image reflects the
+        moment the button was pressed — important when both hands are occupied
+        with probes and the footswitch or on-screen button is used to trigger
+        the save.
+
+        Once the data has been fetched in the background, the save dialog opens
+        so the user can choose a filename.  The setup file is saved alongside
+        the screenshot with the same base name and a .set extension.
         """
         if self._busy:
             return
 
-        # Show dialog on main thread before starting any background work.
-        # Bring window to front in case it was minimised (triggered via footswitch).
-        default_name = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
-        start_path = os.path.join(self._last_save_dir, default_name)
+        # Fetch data immediately — this is the moment the user wants captured.
+        self._set_busy(True)
 
-        self.showNormal()
+        color    = self.color_cb.isChecked()
+        inverted = self.invert_cb.isChecked()
+        save_dir = self._last_save_dir
+
+        def worker():
+            try:
+                png_data   = self.scope.get_screenshot_png(color=color, inverted=inverted)
+                setup_data = self.scope.get_setup()
+                self.result_queue.put(("save_fetched", (png_data, setup_data, save_dir)))
+            except Exception as e:
+                self.result_queue.put(("save_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_save_dialog(self, png_data: bytes, setup_data: bytes, save_dir: str):
+        """Open the save-file dialog after data has already been fetched.
+        Called from _process_results once the background fetch completes."""
+        default_name = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
+        start_path   = os.path.join(save_dir, default_name)
+
+        # Bring window to front only if it is actually minimised (e.g. triggered
+        # by footswitch while window was minimised).  Calling showNormal()
+        # unconditionally resizes a maximised window, which is undesirable.
+        if self.isMinimized():
+            self.showNormal()
         self.raise_()
         self.activateWindow()
 
@@ -1178,7 +1205,9 @@ class MainWindow(QWidget):
         dialog.selectFile(default_name)   # pre-fill with timestamp, text selected
 
         if not dialog.exec():
-            return  # cancelled — scope not queried
+            # User cancelled — data was already fetched but we discard it.
+            self.log_msg("Save cancelled")
+            return
 
         filename = dialog.selectedFiles()[0]
         if not filename.lower().endswith(".png"):
@@ -1186,21 +1215,17 @@ class MainWindow(QWidget):
 
         self._last_save_dir = os.path.dirname(filename)
 
-        # Fetch screenshot and setup in a background thread to keep UI responsive.
-        self._set_busy(True)
-
-        color = self.color_cb.isChecked()
-        inverted = self.invert_cb.isChecked()
-
-        def worker():
-            try:
-                png_data = self.scope.get_screenshot_png(color=color, inverted=inverted)
-                setup_data = self.scope.get_setup()
-                self.result_queue.put(("save_done", (filename, png_data, setup_data)))
-            except Exception as e:
-                self.result_queue.put(("save_error", str(e)))
-
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            self.update_preview_from_png(png_data)
+            with open(filename, "wb") as f:
+                f.write(png_data)
+            base, _ = os.path.splitext(filename)
+            setup_file = base + ".set"
+            with open(setup_file, "wb") as f:
+                f.write(setup_data)
+            self.log_msg(f"Saved: {filename}")
+        except Exception as e:
+            self.log_msg(f"Save error: {e}")
 
     def save_preview_image(self):
         """Save the currently displayed preview PNG to disk — no scope query."""
@@ -1368,23 +1393,16 @@ class MainWindow(QWidget):
                 self._set_busy(False)
                 self.log_msg(f"Preview error: {payload}")
 
-            elif kind == "save_done":
+            elif kind == "save_fetched":
+                # Scope data fetched — now release busy state and open the file
+                # dialog so the user can choose a filename.  The data was captured
+                # at the moment the save button was pressed, not after dialog navigation.
                 self._set_busy(False)
-                filename, png_data, setup_data = payload
+                png_data, setup_data, save_dir = payload
                 if not png_data or not setup_data:
                     self.log_msg("Save failed: no data received from scope")
                     continue
-                try:
-                    self.update_preview_from_png(png_data)
-                    with open(filename, "wb") as f:
-                        f.write(png_data)
-                    base, _ = os.path.splitext(filename)
-                    setup_file = base + ".set"
-                    with open(setup_file, "wb") as f:
-                        f.write(setup_data)
-                    self.log_msg(f"Saved: {filename}")
-                except Exception as e:
-                    self.log_msg(f"Save error: {e}")
+                self._open_save_dialog(png_data, setup_data, save_dir)
 
             elif kind == "save_error":
                 self._set_busy(False)
