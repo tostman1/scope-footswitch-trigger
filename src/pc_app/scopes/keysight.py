@@ -1,4 +1,4 @@
-from .base import BaseScope
+from .base import BaseScope, _strip_ieee_header
 import pyvisa
 
 
@@ -66,15 +66,7 @@ class KeysightScope(BaseScope):
             self.scope.read_termination = '\n'
             self.scope.timeout = old_timeout
 
-        # Strip IEEE-488.2 binary block header (#<n><length><data>)
-        if raw.startswith(b"#"):
-            n = int(raw[1:2])
-            length = int(raw[2:2 + n])
-            data = raw[2 + n:2 + n + length]
-        else:
-            data = raw
-
-        return data
+        return _strip_ieee_header(raw)
 
     def get_setup(self) -> bytes:
         old_timeout = self.scope.timeout
@@ -92,15 +84,7 @@ class KeysightScope(BaseScope):
             self.scope.read_termination = '\n'
             self.scope.timeout = old_timeout
 
-        # Strip IEEE-488.2 binary block header
-        if raw.startswith(b"#"):
-            n = int(raw[1:2])
-            length = int(raw[2:2 + n])
-            data = raw[2 + n:2 + n + length]
-        else:
-            data = raw
-
-        return data
+        return _strip_ieee_header(raw)
 
     def write_setup_data(self, data: bytes) -> bool:
         try:

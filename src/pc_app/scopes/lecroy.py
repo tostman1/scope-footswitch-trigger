@@ -37,18 +37,40 @@ class LeCroyScope(BaseScope):
     def trigger_normal(self):
         self.scope.write("TRIG_MODE NORM")
 
+    def is_running(self) -> bool:
+        """Query the scope live for its current trigger mode.
+        NORM / AUTO = running, STOP / SINGLE = stopped."""
+        try:
+            resp = self.scope.query("TRIG_MODE?").strip().upper()
+            # Running states: NORM (normal trigger), AUTO (auto trigger)
+            self.running = resp in ("NORM", "AUTO")
+            return self.running
+        except Exception as e:
+            self.log(f"Runstate error: {e}")
+            return self.running
+
     def get_screenshot_png(self, color: bool, inverted: bool) -> bytes:
         bckg = "WHITE" if inverted else "BLACK"
 
-        # configure hardcopy for screenshot (TIFF, GPIB port, background color)
-        self.scope.write(f"HCSU DEV,TIFF,PORT,GPIB,BCKG,{bckg}")
-
-        # trigger screenshot
-        data = self.scope.query_binary_values(
-            "SCDP",
-            datatype='B',
-            container=bytes
-        )
+        old_write_term = self.scope.write_termination
+        old_read_term  = self.scope.read_termination
+        old_timeout    = self.scope.timeout
+        self.scope.write_termination = ''
+        self.scope.read_termination  = ''
+        self.scope.timeout = 10000
+        try:
+            # configure hardcopy for screenshot (TIFF, GPIB port, background color)
+            self.scope.write(f"HCSU DEV,TIFF,PORT,GPIB,BCKG,{bckg}")
+            # trigger screenshot
+            data = self.scope.query_binary_values(
+                "SCDP",
+                datatype='B',
+                container=bytes
+            )
+        finally:
+            self.scope.write_termination = old_write_term
+            self.scope.read_termination  = old_read_term
+            self.scope.timeout           = old_timeout
 
         # convert TIFF -> PNG
         image = Image.open(io.BytesIO(data))

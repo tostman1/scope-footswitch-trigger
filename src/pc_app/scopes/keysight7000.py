@@ -1,5 +1,5 @@
 from .keysight import KeysightScope
-import pyvisa
+from .base import _strip_ieee_header
 
 
 # ----------------------------
@@ -36,12 +36,4 @@ class Keysight7000Scope(KeysightScope):
             self.scope.read_termination = '\n'
             self.scope.timeout = old_timeout
 
-        # Strip IEEE-488.2 binary block header
-        if raw.startswith(b"#"):
-            n = int(raw[1:2])
-            length = int(raw[2:2 + n])
-            data = raw[2 + n:2 + n + length]
-        else:
-            data = raw
-
-        return data
+        return _strip_ieee_header(raw)

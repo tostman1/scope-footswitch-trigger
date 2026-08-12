@@ -8,14 +8,14 @@ import serial
 import serial.tools.list_ports
 import time
 import pyvisa
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtGui import QPixmap, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QLayout, QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QComboBox, QCheckBox, QTextEdit,
+    QHBoxLayout, QComboBox, QCheckBox, QTextEdit, QSpinBox,
     QFileDialog, QSizePolicy, QGridLayout, QFrame, QGroupBox
 )
 
@@ -121,7 +121,7 @@ class ScopeController:
         """Thread-safe logging: post to UI queue instead of calling Qt directly."""
         self._ui_queue.put(("scope_log", msg))
 
-    def connect(self, ip):
+    def connect(self, ip, timeout_ms: int = 5000):
         self._last_ip = ip
         with self.lock:
             # Always create a fresh ResourceManager for each connection attempt.
@@ -131,7 +131,7 @@ class ScopeController:
                 pass
             self.rm = pyvisa.ResourceManager("@py")
             self.scope = self.rm.open_resource(f"TCPIP0::{ip}::INSTR")
-            self.scope.timeout = 5000
+            self.scope.timeout = timeout_ms
 
             idn = self.scope.query("*IDN?")
             idn_u = idn.upper()
@@ -198,18 +198,23 @@ class ScopeController:
         self._disconnect()
 
     def shutdown(self):
-        """Stop background threads cleanly. Call from closeEvent."""
+        """Stop background threads cleanly. Call from closeEvent.
+        Sets flags first so any in-progress reconnect worker exits at its next
+        checkpoint, then closes the VISA resource without holding the lock
+        (to avoid deadlocking if connect() is mid-execution in the reconnect worker)."""
         self.keep_alive_running = False
         self._stop_reconnect = True
         self._last_ip = ""
-        with self.lock:
-            try:
-                if self.scope:
-                    self.scope.close()
-            except Exception:
-                pass
-            self.scope = None
-            self.device = None
+        # Give the reconnect worker one iteration to notice the stop flag.
+        # We do NOT acquire self.lock here to avoid deadlock if connect() is
+        # currently holding it on the reconnect thread.
+        try:
+            if self.scope:
+                self.scope.close()
+        except Exception:
+            pass
+        self.scope = None
+        self.device = None
 
     def _auto_reconnect(self):
         """Try to reconnect to the last known IP in the background.
@@ -366,6 +371,7 @@ class MainWindow(QWidget):
         self._waiting_for_single = False    # True after B2S/B2L until scope stops
         self._single_poll_counter = 0       # counts 50ms ticks between polls
         self._single_poll_total = 0         # total ticks since SINGLE — for timeout
+        self._single_poll_active = False    # True while a poll worker is in flight
 
         # ScopeController posts all messages to result_queue so background
         # threads never touch Qt widgets directly (thread safety).
@@ -374,6 +380,7 @@ class MainWindow(QWidget):
         self.init_ui()
         self._load_settings()
         self.refresh_serial_ports()
+        self._restore_serial_port()   # must run after refresh_serial_ports()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
@@ -385,22 +392,38 @@ class MainWindow(QWidget):
         ip = self.settings.value("scope_ip", "10.53.48.1")
         self.ip_combo.setCurrentText(ip)
 
-        last_port = self.settings.value("serial_port", "")
-        if last_port:
-            idx = self.serial_combo.findData(last_port)
-            if idx >= 0:
-                self.serial_combo.setCurrentIndex(idx)
+        # Serial port is restored in _restore_serial_port(), called after
+        # refresh_serial_ports() so the combo is already populated.
+        self._saved_serial_port = self.settings.value("serial_port", "")
 
         self._last_save_dir = self.settings.value("save_dir", "")
 
         auto = self.settings.value("auto_preview", False, type=bool)
         self.auto_preview_cb.setChecked(auto)
 
+        timeout = self.settings.value("scpi_timeout", 5000, type=int)
+        self.scpi_timeout_spin.setValue(timeout)
+
+        # Restore window geometry
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+    def _restore_serial_port(self):
+        """Restore last-used serial port after refresh_serial_ports() populates the combo."""
+        port = getattr(self, "_saved_serial_port", "")
+        if port:
+            idx = self.serial_combo.findData(port)
+            if idx >= 0:
+                self.serial_combo.setCurrentIndex(idx)
+
     def _save_settings(self):
         self.settings.setValue("scope_ip", self._get_ip())
         self.settings.setValue("serial_port", self.serial_combo.currentData() or "")
         self.settings.setValue("save_dir", self._last_save_dir)
         self.settings.setValue("auto_preview", self.auto_preview_cb.isChecked())
+        self.settings.setValue("scpi_timeout", self.scpi_timeout_spin.value())
+        self.settings.setValue("window_geometry", self.saveGeometry())
 
     # ---------- UI Init ----------
 
@@ -512,6 +535,22 @@ class MainWindow(QWidget):
         )
         settings_layout.addWidget(self.auto_preview_cb)
 
+        # SCPI timeout
+        timeout_row = QHBoxLayout()
+        timeout_row.setSpacing(6)
+        timeout_lbl = QLabel("SCPI timeout (ms):")
+        self.scpi_timeout_spin = QSpinBox()
+        self.scpi_timeout_spin.setRange(1000, 30000)
+        self.scpi_timeout_spin.setSingleStep(500)
+        self.scpi_timeout_spin.setValue(5000)
+        self.scpi_timeout_spin.setToolTip(
+            "Timeout for VISA/SCPI queries.\n"
+            "Increase if the scope is slow to respond."
+        )
+        timeout_row.addWidget(timeout_lbl)
+        timeout_row.addWidget(self.scpi_timeout_spin)
+        settings_layout.addLayout(timeout_row)
+
         # Future settings go here — add more QCheckBox / QWidget rows above this comment
 
         config_row.addWidget(settings_box)
@@ -548,8 +587,7 @@ class MainWindow(QWidget):
             ("#1a9e7a", "#2ab88e", "#147a5e"),   # B2   — teal
         ]
 
-        _HDR_STYLE = "font-weight: bold; font-size: 10pt;"
-        _ROW_STYLE = "font-weight: bold; font-size: 10pt;"
+        _LABEL_STYLE = "font-weight: bold; font-size: 10pt;"
 
         fs_grid = QGridLayout()
         fs_grid.setSpacing(6)
@@ -562,14 +600,14 @@ class MainWindow(QWidget):
         for btn_col, hdr in enumerate(["B1  (Left)", "B1+B2  (Both)", "B2  (Right)"]):
             lbl = QLabel(hdr)
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet(_HDR_STYLE)
+            lbl.setStyleSheet(_LABEL_STYLE)
             fs_grid.addWidget(lbl, 0, btn_col + 1)
 
         # Row labels in col 0, same font as column headers
         for grid_row, label in [(1, "Short"), (2, "Long")]:
             lbl = QLabel(label)
             lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            lbl.setStyleSheet(_ROW_STYLE)
+            lbl.setStyleSheet(_LABEL_STYLE)
             fs_grid.addWidget(lbl, grid_row, 0)
 
         # Button definitions: (grid_row, btn_col 0-2, event, text)
@@ -794,18 +832,13 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
-        def query_idn(ip, results, lock):
-            """Phase 2: open a fresh, private VISA RM for each confirmed host
-            and query *IDN?. Each call gets its own RM so there is no shared
-            state that could corrupt ScopeController's RM."""
+        def query_idn(ip, results, lock, rm):
+            """Phase 2: query *IDN? on a confirmed host using the shared scan RM."""
             try:
-                rm = pyvisa.ResourceManager("@py")
                 inst = rm.open_resource(f"TCPIP0::{ip}::INSTR")
                 inst.timeout = 2000
                 idn = inst.query("*IDN?").strip()
                 inst.close()
-                # Do NOT call rm.close() — pyvisa ResourceManager is a singleton;
-                # closing it would invalidate ScopeController's RM as well.
                 idn_parts = idn.split(",")
                 if len(idn_parts) >= 2:
                     short = f"{ip}  —  {idn_parts[0].strip()} {idn_parts[1].strip()}"
@@ -821,32 +854,43 @@ class MainWindow(QWidget):
             lock = threading.Lock()
             candidates = set()
 
-            # Phase 1: bounded thread pool for raw-socket sweep (max 50 workers).
-            # 254 hosts × 2 ports = 508 tasks, but only 50 run simultaneously
-            # to avoid exhausting OS thread/socket resources.
-            host_port_pairs = [
-                (f"{subnet}.{i}", port)
-                for i in range(1, 255)
-                for port in (111, 5025)
-            ]
-            with ThreadPoolExecutor(max_workers=50) as pool:
-                futures = {
-                    pool.submit(probe_port, ip, port, candidates, lock): (ip, port)
-                    for ip, port in host_port_pairs
-                }
-                for f in as_completed(futures, timeout=2.0):
-                    pass  # results collected via candidates set in probe_port
+            try:
+                # Phase 1: bounded thread pool sweep (max 50 concurrent workers).
+                # 254 hosts × 2 ports = 508 tasks. Per-socket timeout is 0.5s,
+                # so worst-case phase 1 takes ~ceil(508/50) × 0.5 ≈ 6 seconds.
+                # The pool's __exit__ waits for all submitted tasks to complete —
+                # no manual timeout needed here.
+                host_port_pairs = [
+                    (f"{subnet}.{i}", port)
+                    for i in range(1, 255)
+                    for port in (111, 5025)
+                ]
+                with ThreadPoolExecutor(max_workers=50) as pool:
+                    for ip, port in host_port_pairs:
+                        pool.submit(probe_port, ip, port, candidates, lock)
+                # pool.__exit__ blocks here until all tasks finish
 
-            if not candidates:
-                self.result_queue.put(("scan_done", []))
-                return
+                if not candidates:
+                    self.result_queue.put(("scan_done", []))
+                    return
 
-            # Phase 2: query *IDN? on confirmed hosts only (sequential, own RM each)
-            for ip in sorted(candidates, key=lambda x: int(x.split(".")[-1])):
-                query_idn(ip, found, lock)
+                # Phase 2: query *IDN? only on confirmed hosts using one shared scan RM.
+                # A separate RM from ScopeController.rm ensures scan activity cannot
+                # corrupt the connection state of an active scope session.
+                self.result_queue.put((
+                    "scope_log",
+                    f"Port scan complete — {len(candidates)} host(s) responded. "
+                    f"Querying *IDN?…"
+                ))
+                scan_rm = pyvisa.ResourceManager("@py")
+                for ip in sorted(candidates, key=lambda x: int(x.split(".")[-1])):
+                    query_idn(ip, found, lock, scan_rm)
 
-            found.sort(key=lambda x: int(x[0].split(".")[-1]))
-            self.result_queue.put(("scan_done", found))
+                found.sort(key=lambda x: int(x[0].split(".")[-1]))
+                self.result_queue.put(("scan_done", found))
+
+            except Exception as e:
+                self.result_queue.put(("scan_error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -856,8 +900,10 @@ class MainWindow(QWidget):
             QApplication.setOverrideCursor(Qt.WaitCursor)
         else:
             QApplication.restoreOverrideCursor()
-        # disable/enable screenshot buttons
+        # disable/enable screenshot and footswitch buttons while an operation runs
         for btn in (self.preview_btn, self.save_btn, self.load_setup_btn):
+            btn.setEnabled(not busy)
+        for btn in self._fs_buttons.values():
             btn.setEnabled(not busy)
 
     # ---------- Scope connection ----------
@@ -872,7 +918,7 @@ class MainWindow(QWidget):
     def toggle_scope_connection(self):
         if self.scope.is_connected:
             self.scope.disconnect()
-            # _on_scope_disconnected will update the UI
+            # scope_disconnected message will be posted to result_queue by ScopeController
         else:
             self._connect_scope()
 
@@ -892,7 +938,7 @@ class MainWindow(QWidget):
             self.log_msg(f"Invalid IP address: '{ip}'  (expected format: 192.168.1.10)")
             return
         try:
-            idn = self.scope.connect(ip)
+            idn = self.scope.connect(ip, timeout_ms=self.scpi_timeout_spin.value())
             self.log_msg(f"Connected to scope: {idn.strip()}")
             self._set_scope_connected(True)
             # Flash identify message on the scope screen for 5 seconds,
@@ -950,8 +996,6 @@ class MainWindow(QWidget):
             self.ip_combo.setEnabled(True)
             self.scan_btn.setEnabled(True)
             self.identify_cb.setChecked(False)
-
-
 
     def identify_scope(self, checked: bool):
         try:
@@ -1135,10 +1179,23 @@ class MainWindow(QWidget):
         self._last_save_dir = os.path.dirname(filename)
         self._set_busy(True)
 
+        # Warn if the setup file extension doesn't match the connected scope type.
+        # This is a heuristic — Keysight .set files start with "#", LeCroy with "LSET".
+        scope_type = type(self.scope.device).__name__ if self.scope.device else ""
+
         def worker():
             try:
                 with open(filename, "rb") as f:
                     data = f.read()
+                # Heuristic mismatch detection
+                is_lecroy_file = data[:4] == b"LSET"
+                is_lecroy_scope = "LeCroy" in scope_type
+                if is_lecroy_file and not is_lecroy_scope:
+                    self.result_queue.put(("scope_log",
+                        "Warning: setup file appears to be LeCroy format but scope is Keysight"))
+                elif not is_lecroy_file and is_lecroy_scope:
+                    self.result_queue.put(("scope_log",
+                        "Warning: setup file appears to be Keysight format but scope is LeCroy"))
                 ok = self.scope.write_setup_data(data)
                 self.result_queue.put(("load_setup_done", (filename, ok)))
             except Exception as e:
@@ -1175,6 +1232,7 @@ class MainWindow(QWidget):
             self._waiting_for_single = False
             self._single_poll_counter = 0
             self._single_poll_total = 0
+            self._single_poll_active = False
             return
 
         self._single_poll_counter += 1
@@ -1182,12 +1240,18 @@ class MainWindow(QWidget):
             return
         self._single_poll_counter = 0
 
+        if self._single_poll_active:
+            return  # previous poll worker still in flight — skip this tick
+        self._single_poll_active = True
+
         def worker():
             try:
                 running = self.scope.is_running()
                 self.result_queue.put(("single_poll", running))
             except Exception:
                 pass  # silently skip failed polls
+            finally:
+                self._single_poll_active = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1196,6 +1260,12 @@ class MainWindow(QWidget):
             msg = self.event_queue.get()
             if msg.startswith("ERROR:"):
                 self.log_msg(f"Serial error: {msg[6:]}")
+                # Reset UI if the port died unexpectedly (e.g. USB unplugged)
+                if self._serial_open:
+                    self._serial_open = False
+                    self.serial_thread = None
+                    self._set_serial_open(False)
+                    self.log_msg("Footswitch disconnected — port closed")
             elif not self._busy:
                 self.handle_event(msg)
 
@@ -1213,7 +1283,7 @@ class MainWindow(QWidget):
             elif kind == "scope_reconnected":
                 idn = payload
                 self._set_scope_connected(True)
-                self.log_msg(f"Auto-reconnected: {idn}")
+                self.log_msg(f"Auto-reconnected to scope: {idn}")
                 self._flash_identify()
 
             elif kind == "preview_done":
@@ -1269,6 +1339,7 @@ class MainWindow(QWidget):
                     self._waiting_for_single = False
                     self._single_poll_counter = 0
                     self._single_poll_total = 0
+                    self._single_poll_active = False
                     self.log_msg("Trigger acquired — loading preview")
                     self.preview_screenshot()
 
@@ -1339,6 +1410,9 @@ class MainWindow(QWidget):
 
             elif event == "BBL":
                 self.save_screenshot_and_setup()
+
+            else:
+                self.log_msg(f"Unknown event received: '{event}' — ignored")
 
         except Exception as e:
             self.log_msg(str(e))
